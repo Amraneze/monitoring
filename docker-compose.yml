@@ -29,7 +29,7 @@ services:
               - targets: ["node_exporter:9100"]
           - job_name: "trivy"
             scrape_interval: 1h
-            scrape_timeout: 10m
+            scrape_timeout: 30s
             static_configs:
               - targets: ["trivy-exporter:9000"]
         EOF
@@ -88,13 +88,86 @@ services:
       - monitoring-network
 
   trivy-exporter:
-    image: ghcr.io/neuroforgede/docker-swarm-trivy-exporter:latest
+    image: aquasec/trivy:latest
     restart: unless-stopped
-    environment:
-      TRIVY_SLOW: "true"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        # Install Python's http.server (busybox ash compatible)
+        apk add --no-cache python3 2>/dev/null || true
+
+        METRICS_FILE=/cache/metrics.prom
+        LOCK_FILE=/cache/scan.lock
+
+        # Serve cached metrics file on port 9000 in background
+        serve_metrics() {
+          while true; do
+            if [ -f "$METRICS_FILE" ]; then
+              CONTENT=$(cat "$METRICS_FILE")
+              LENGTH=$(echo -n "$CONTENT" | wc -c)
+              echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: $LENGTH\r\nConnection: close\r\n\r\n$CONTENT" | nc -l -p 9000 -q 1
+            else
+              echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n# Trivy scan not yet complete, please wait..." | nc -l -p 9000 -q 1
+            fi
+          done
+        }
+
+        # Run trivy scan and write prometheus metrics
+        run_scan() {
+          echo "Starting Trivy scan of all local images..."
+          TMP_FILE=/cache/metrics.tmp
+          echo "# HELP trivy_vulnerabilities Vulnerability count by image, package and severity" > "$TMP_FILE"
+          echo "# TYPE trivy_vulnerabilities gauge" >> "$TMP_FILE"
+
+          for img in $(trivy image --list-all-pkgs --quiet 2>/dev/null || docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>'); do
+            echo "Scanning $img ..."
+            trivy image \
+              --format json \
+              --quiet \
+              --no-progress \
+              --cache-dir /cache/trivycache \
+              "$img" 2>/dev/null | \
+            python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            image = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
+            image = image.replace('\"','').replace(' ','_')
+            for result in data.get('Results', []):
+                for vuln in result.get('Vulnerabilities', []) or []:
+                    pkg = vuln.get('PkgName','unknown').replace('\"','')
+                    sev = vuln.get('Severity','UNKNOWN')
+                    vid = vuln.get('VulnerabilityID','').replace('\"','')
+                    ins = vuln.get('InstalledVersion','').replace('\"','')
+                    fix = vuln.get('FixedVersion','').replace('\"','')
+                    print(f'trivy_vulnerabilities{{image=\"{image}\",package=\"{pkg}\",severity=\"{sev}\",vuln_id=\"{vid}\",installed=\"{ins}\",fixed=\"{fix}\"}} 1')
+        except Exception as e:
+            pass
+        " "$img" >> "$TMP_FILE" 2>/dev/null || true
+          done
+
+          mv "$TMP_FILE" "$METRICS_FILE"
+          echo "Scan complete. Metrics written to $METRICS_FILE"
+        }
+
+        # Check if nc (netcat) is available, install if not
+        which nc 2>/dev/null || apk add --no-cache netcat-openbsd 2>/dev/null || true
+
+        # Initial scan
+        run_scan &
+
+        # Start metrics server in background
+        serve_metrics &
+
+        # Re-scan every 6 hours
+        while true; do
+          sleep 21600
+          run_scan
+        done
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - trivy-cache:/trivycache
+      - trivy-cache:/cache
     networks:
       - monitoring-network
 
