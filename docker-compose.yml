@@ -94,77 +94,129 @@ services:
     command:
       - -c
       - |
-        # Install Python's http.server (busybox ash compatible)
-        apk add --no-cache python3 2>/dev/null || true
+        apk add --no-cache python3 docker-cli 2>/dev/null
 
         METRICS_FILE=/cache/metrics.prom
-        LOCK_FILE=/cache/scan.lock
+        CACHE_DIR=/cache/trivycache
 
-        # Serve cached metrics file on port 9000 in background
-        serve_metrics() {
-          while true; do
-            if [ -f "$METRICS_FILE" ]; then
-              CONTENT=$(cat "$METRICS_FILE")
-              LENGTH=$(echo -n "$CONTENT" | wc -c)
-              echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: $LENGTH\r\nConnection: close\r\n\r\n$CONTENT" | nc -l -p 9000 -q 1
-            else
-              echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n# Trivy scan not yet complete, please wait..." | nc -l -p 9000 -q 1
-            fi
-          done
-        }
+        # Write the Python HTTP server to a file
+        cat > /tmp/serve.py << 'PYEOF'
+        import http.server
+        import os
 
-        # Run trivy scan and write prometheus metrics
-        run_scan() {
-          echo "Starting Trivy scan of all local images..."
-          TMP_FILE=/cache/metrics.tmp
-          echo "# HELP trivy_vulnerabilities Vulnerability count by image, package and severity" > "$TMP_FILE"
-          echo "# TYPE trivy_vulnerabilities gauge" >> "$TMP_FILE"
+        METRICS_FILE = "/cache/metrics.prom"
 
-          for img in $(trivy image --list-all-pkgs --quiet 2>/dev/null || docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>'); do
-            echo "Scanning $img ..."
-            trivy image \
-              --format json \
-              --quiet \
-              --no-progress \
-              --cache-dir /cache/trivycache \
-              "$img" 2>/dev/null | \
-            python3 -c "
-        import sys, json
-        try:
-            data = json.load(sys.stdin)
-            image = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
-            image = image.replace('\"','').replace(' ','_')
-            for result in data.get('Results', []):
-                for vuln in result.get('Vulnerabilities', []) or []:
-                    pkg = vuln.get('PkgName','unknown').replace('\"','')
-                    sev = vuln.get('Severity','UNKNOWN')
-                    vid = vuln.get('VulnerabilityID','').replace('\"','')
-                    ins = vuln.get('InstalledVersion','').replace('\"','')
-                    fix = vuln.get('FixedVersion','').replace('\"','')
-                    print(f'trivy_vulnerabilities{{image=\"{image}\",package=\"{pkg}\",severity=\"{sev}\",vuln_id=\"{vid}\",installed=\"{ins}\",fixed=\"{fix}\"}} 1')
-        except Exception as e:
-            pass
-        " "$img" >> "$TMP_FILE" 2>/dev/null || true
-          done
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if os.path.exists(METRICS_FILE):
+                    with open(METRICS_FILE, "r") as f:
+                        content = f.read()
+                else:
+                    content = "# Trivy scan not yet complete, please wait...\n"
+                encoded = content.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
 
-          mv "$TMP_FILE" "$METRICS_FILE"
-          echo "Scan complete. Metrics written to $METRICS_FILE"
-        }
+            def log_message(self, format, *args):
+                pass  # silence access logs
 
-        # Check if nc (netcat) is available, install if not
-        which nc 2>/dev/null || apk add --no-cache netcat-openbsd 2>/dev/null || true
+        print("Trivy metrics server listening on port 9000...")
+        server = http.server.HTTPServer(("0.0.0.0", 9000), Handler)
+        server.serve_forever()
+        PYEOF
 
-        # Initial scan
-        run_scan &
+        # Write the scan script to a file
+        cat > /tmp/scan.py << 'PYEOF'
+        import subprocess, json, os, sys, time
 
-        # Start metrics server in background
-        serve_metrics &
+        METRICS_FILE = "/cache/metrics.prom"
+        TMP_FILE     = "/cache/metrics.tmp"
+        CACHE_DIR    = "/cache/trivycache"
 
-        # Re-scan every 6 hours
-        while true; do
-          sleep 21600
-          run_scan
-        done
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+        def get_images():
+            result = subprocess.run(
+                ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                capture_output=True, text=True
+            )
+            images = [
+                i for i in result.stdout.strip().splitlines()
+                if i and "<none>" not in i
+            ]
+            return list(set(images))
+
+        def scan_image(image):
+            result = subprocess.run(
+                [
+                    "trivy", "image",
+                    "--format", "json",
+                    "--quiet",
+                    "--no-progress",
+                    "--cache-dir", CACHE_DIR,
+                    image
+                ],
+                capture_output=True, text=True, timeout=600
+            )
+            try:
+                return json.loads(result.stdout)
+            except Exception:
+                return None
+
+        def escape(val):
+            return str(val).replace('"', '\\"').replace("\n", "")
+
+        def write_metrics(all_metrics):
+            with open(TMP_FILE, "w") as f:
+                f.write("# HELP trivy_vulnerabilities Vulnerability detected by trivy\n")
+                f.write("# TYPE trivy_vulnerabilities gauge\n")
+                for line in all_metrics:
+                    f.write(line + "\n")
+            os.replace(TMP_FILE, METRICS_FILE)
+
+        while True:
+            images = get_images()
+            print(f"[trivy-scan] Found {len(images)} images to scan", flush=True)
+            all_metrics = []
+
+            for image in images:
+                print(f"[trivy-scan] Scanning {image} ...", flush=True)
+                data = scan_image(image)
+                if not data:
+                    print(f"[trivy-scan] No data for {image}", flush=True)
+                    continue
+
+                count = 0
+                for result in data.get("Results", []):
+                    for vuln in result.get("Vulnerabilities") or []:
+                        labels = (
+                            f'image="{escape(image)}",'
+                            f'package="{escape(vuln.get("PkgName",""))}",'
+                            f'severity="{escape(vuln.get("Severity","UNKNOWN"))}",'
+                            f'vuln_id="{escape(vuln.get("VulnerabilityID",""))}",'
+                            f'installed="{escape(vuln.get("InstalledVersion",""))}",'
+                            f'fixed="{escape(vuln.get("FixedVersion",""))}"'
+                        )
+                        all_metrics.append(f"trivy_vulnerabilities{{{labels}}} 1")
+                        count += 1
+
+                print(f"[trivy-scan] {image} -> {count} vulnerabilities", flush=True)
+
+            write_metrics(all_metrics)
+            total = len(all_metrics)
+            print(f"[trivy-scan] Scan complete. {total} total vulnerabilities written.", flush=True)
+            print(f"[trivy-scan] Next scan in 6 hours.", flush=True)
+            time.sleep(21600)
+        PYEOF
+
+        # Start HTTP server in background
+        python3 /tmp/serve.py &
+
+        # Start scan loop in foreground
+        python3 /tmp/scan.py
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - trivy-cache:/cache
