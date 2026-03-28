@@ -155,7 +155,7 @@ services:
   # Tracks per-process CPU, memory RSS, and disk I/O over time.
   # Grouped by executable name so you get one series per process type.
   process_exporter:
-    image: ncabatoff/process-exporter:0.8.3
+    image: ncabatoff/process-exporter:latest
     container_name: process_exporter
     restart: unless-stopped
     privileged: true
