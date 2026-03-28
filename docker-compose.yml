@@ -1,15 +1,5 @@
 version: "3.8"
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  FULL MONITORING STACK
-#  ─ Prometheus + Grafana (UI)
-#  ─ node_exporter      (CPU / RAM / disk utilisation + health sensors)
-#  ─ process_exporter   (per-process CPU / memory / I/O history)
-#  ─ smartctl_exporter  (HDD/SSD bad sectors, SMART health)
-#  ─ rasdaemon_exporter (CPU machine-check exceptions → faulty CPU detection)
-#  ─ trivy_exporter     (container image CVE scanning)
-# ══════════════════════════════════════════════════════════════════════════════
-
 volumes:
   prometheus-data:
   grafana-data:
@@ -35,42 +25,35 @@ services:
             monitor: "server-health"
 
         scrape_configs:
-
           - job_name: "prometheus"
             static_configs:
               - targets: ["prometheus:9090"]
 
-          # Hardware utilisation + health sensors (CPU temp, ECC errors, disk space)
           - job_name: "node_exporter"
             scrape_interval: 10s
             static_configs:
               - targets: ["node_exporter:9100"]
 
-          # Per-process CPU / memory / disk I/O history
           - job_name: "process_exporter"
             scrape_interval: 10s
             static_configs:
               - targets: ["process_exporter:9256"]
 
-          # HDD / SSD SMART health: bad sectors, reallocated sectors, temperature
           - job_name: "smartctl_exporter"
-            scrape_interval: 60s      # SMART reads are slow, 60s is fine
+            scrape_interval: 60s
             static_configs:
               - targets: ["smartctl_exporter:9633"]
 
-          # CPU machine check exceptions (hardware faults / corrected errors)
           - job_name: "rasdaemon_exporter"
             scrape_interval: 30s
             static_configs:
               - targets: ["rasdaemon_exporter:9101"]
 
-          # Container image vulnerability scanning
           - job_name: "trivy"
             scrape_interval: 2m
             scrape_timeout: 30s
             static_configs:
               - targets: ["trivy_exporter:9000"]
-
         EOF
         exec /bin/prometheus \
           --config.file=/etc/prometheus/prometheus.yml \
@@ -97,17 +80,12 @@ services:
         condition: service_healthy
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin          # ⚠️ change this
+      GF_SECURITY_ADMIN_PASSWORD: admin
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
-      # Auto-provision Prometheus as data source
-      GF_DATASOURCES_DEFAULT_NAME: Prometheus
-      GF_DATASOURCES_DEFAULT_TYPE: prometheus
-      GF_DATASOURCES_DEFAULT_URL: http://prometheus:9090
+      SERVICE_FQDN_GRAFANA: ${SERVICE_FQDN_GRAFANA}
     volumes:
       - grafana-data:/var/lib/grafana
-    ports:
-      - "3000:3000"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
       interval: 30s
@@ -117,8 +95,9 @@ services:
       - monitoring-network
 
   # ── 3. NODE EXPORTER ─────────────────────────────────────────────────────────
-  # Exposes: CPU, RAM, disk space, network, load avg, hardware temps (hwmon),
-  #          ECC memory errors (edac), filesystem health
+  # FIX: removed --collector.systemd and dbus socket mount
+  # AppArmor on this host blocks dbus access from containers — removing it
+  # stops the errors and still gives full CPU/RAM/disk/temp/network metrics.
   node_exporter:
     image: quay.io/prometheus/node-exporter:v1.7.0
     container_name: node_exporter
@@ -126,23 +105,21 @@ services:
     pid: host
     command:
       - "--path.rootfs=/host"
-      - "--collector.systemd"
       - "--collector.processes"
       - "--collector.diskstats"
       - "--collector.filesystem"
       - "--collector.meminfo"
       - "--collector.cpu"
       - "--collector.loadavg"
-      - "--collector.hwmon"        # CPU / disk / board temperatures & fan speeds
-      - "--collector.edac"         # ECC RAM corrected/uncorrected error counts
+      - "--collector.hwmon"
+      - "--collector.edac"
       - "--collector.netstat"
       - "--collector.stat"
       - "--collector.vmstat"
-      # Ignore virtual/container filesystems to reduce noise
       - '--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|run/docker/.+)($$|/)'
     volumes:
       - /:/host:ro,rslave
-      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+      # Removed: dbus socket (AppArmor blocks it on this host)
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9100/metrics"]
       interval: 30s
@@ -152,20 +129,31 @@ services:
       - monitoring-network
 
   # ── 4. PROCESS EXPORTER ──────────────────────────────────────────────────────
-  # Tracks per-process CPU, memory RSS, and disk I/O over time.
-  # Grouped by executable name so you get one series per process type.
+  # FIX: config is now written inline via entrypoint instead of a bind-mount.
+  # Coolify was creating a directory at the config path instead of a file,
+  # causing "is a directory" errors. Writing it at startup avoids this entirely.
   process_exporter:
     image: ncabatoff/process-exporter:latest
     container_name: process_exporter
     restart: unless-stopped
     privileged: true
     pid: host
+    entrypoint: /bin/sh
     command:
-      - "--config.path=/etc/process-exporter/config.yml"
-      - "--procfs=/host/proc"
+      - -c
+      - |
+        mkdir -p /etc/process-exporter
+        cat > /etc/process-exporter/config.yml << 'EOF'
+        process_names:
+          - name: "{{.Comm}}"
+            cmdline:
+              - ".+"
+        EOF
+        exec /bin/process-exporter \
+          --config.path=/etc/process-exporter/config.yml \
+          --procfs=/host/proc
     volumes:
       - /proc:/host/proc:ro
-      - ./config/process-exporter-config.yml:/etc/process-exporter/config.yml:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9256/metrics"]
       interval: 30s
@@ -175,25 +163,17 @@ services:
       - monitoring-network
 
   # ── 5. SMARTCTL EXPORTER ─────────────────────────────────────────────────────
-  # Reads SMART data from all drives:
-  #   • Overall health (PASSED / FAILED)
-  #   • Reallocated sectors (early sign of drive failure)
-  #   • Pending sectors (sectors waiting to be reallocated)
-  #   • Uncorrectable errors
-  #   • Drive temperature
-  #   • Power-on hours
-  #   • SSD wear level / remaining life
   smartctl_exporter:
     image: prometheuscommunity/smartctl-exporter:v0.12.0
     container_name: smartctl_exporter
     restart: unless-stopped
-    privileged: true              # needs raw disk access
+    privileged: true
     user: root
     command:
       - "--smartctl.path=/usr/sbin/smartctl"
-      - "--smartctl.interval=120s"   # how often to poll drives
+      - "--smartctl.interval=120s"
     volumes:
-      - /dev:/dev:ro               # access to raw disk devices
+      - /dev:/dev:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9633/metrics"]
       interval: 60s
@@ -202,38 +182,74 @@ services:
     networks:
       - monitoring-network
 
-  # ── 6. RASDAEMON EXPORTER ────────────────────────────────────────────────────
-  # Monitors CPU Machine Check Exceptions (MCE) — the Linux mechanism that
-  # reports hardware errors: faulty CPU cores, bad RAM, bus errors, etc.
-  #
-  # How it works:
-  #   rasdaemon collects MCE events from the kernel into a SQLite DB.
-  #   This exporter reads that DB and exposes the counts as Prometheus metrics.
-  #
-  # ⚠️  rasdaemon must be running on the HOST (not in Docker) to capture events.
-  #     Install it with: sudo apt install rasdaemon && sudo systemctl enable --now rasdaemon
-  #
-  # This container then reads the rasdaemon database from the host.
+  # ── 6. RASDAEMON EXPORTER (inline Python, no external image) ─────────────────
   rasdaemon_exporter:
-    image: pbrane/rasdaemon-exporter:latest
+    image: python:3.12-alpine
     container_name: rasdaemon_exporter
     restart: unless-stopped
-    volumes:
-      - /var/lib/rasdaemon:/var/lib/rasdaemon:ro   # rasdaemon SQLite DB
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        pip install --quiet --no-cache-dir prometheus_client 2>/dev/null
+        cat > /exporter.py << 'PYEOF'
+        import os, time, sqlite3, logging
+        from prometheus_client import start_http_server, Gauge
+
+        DB_PATH = os.environ.get("RASDAEMON_DB", "/var/lib/rasdaemon/ras-mc_event.db")
+        PORT    = int(os.environ.get("LISTEN_PORT", "9101"))
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+        mce_total   = Gauge("rasdaemon_mce_events_total", "Total MCE events recorded by rasdaemon")
+        mce_by_type = Gauge("rasdaemon_mce_events_by_type", "MCE events by error type", ["error_type"])
+        db_available = Gauge("rasdaemon_db_available", "1 if rasdaemon DB is readable")
+
+        def collect():
+            if not os.path.exists(DB_PATH):
+                db_available.set(0)
+                mce_total.set(0)
+                return
+            try:
+                conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+                cur  = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM mce_record")
+                total = cur.fetchone()[0] or 0
+                mce_total.set(total)
+                db_available.set(1)
+                try:
+                    cur.execute("SELECT error_msg, COUNT(*) FROM mce_record GROUP BY error_msg LIMIT 50")
+                    for row in cur.fetchall():
+                        mce_by_type.labels(error_type=(row[0] or "unknown")[:120]).set(row[1])
+                except sqlite3.OperationalError:
+                    pass
+                conn.close()
+                logging.info(f"Collected: {total} MCE events total")
+            except Exception as e:
+                logging.error(f"DB read error: {e}")
+                db_available.set(0)
+
+        logging.info(f"rasdaemon exporter starting on :{PORT}")
+        start_http_server(PORT)
+        while True:
+            collect()
+            time.sleep(30)
+        PYEOF
+        exec python3 /exporter.py
     environment:
       - RASDAEMON_DB=/var/lib/rasdaemon/ras-mc_event.db
       - LISTEN_PORT=9101
+    volumes:
+      - /var/lib/rasdaemon:/var/lib/rasdaemon:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9101/metrics"]
       interval: 60s
       timeout: 10s
       retries: 3
+      start_period: 30s
     networks:
       - monitoring-network
 
   # ── 7. TRIVY EXPORTER ────────────────────────────────────────────────────────
-  # Scans all local Docker images for CVEs every 6 hours.
-  # Exposes results as Prometheus metrics on :9000.
   trivy_exporter:
     image: aquasec/trivy:canary
     container_name: trivy_exporter
@@ -243,9 +259,6 @@ services:
       - -c
       - |
         apk add --no-cache python3 docker-cli 2>/dev/null
-
-        METRICS_FILE=/cache/metrics.prom
-        CACHE_DIR=/cache/trivycache
 
         cat > /tmp/serve.py << 'PYEOF'
         import http.server, os
@@ -316,7 +329,7 @@ services:
             print(f"[trivy-scan] Scanning {len(images)} images...", flush=True)
             all_metrics = []
             for image in images:
-                print(f"[trivy-scan] Scanning {image} ...", flush=True)
+                print(f"[trivy-scan] Scanning {image}...", flush=True)
                 data = scan_image(image)
                 if not data:
                     continue
