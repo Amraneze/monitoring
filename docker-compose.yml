@@ -5,6 +5,7 @@ volumes:
   grafana-data:
   trivy-cache:
   process-exporter-config:
+  process-exporter-bin:    # contains the process-exporter binary, populated once via docker cp
 
 services:
 
@@ -36,7 +37,8 @@ services:
               - targets: ["node_exporter:9100"]
 
           - job_name: "process_exporter"
-            scrape_interval: 10s
+            scrape_interval: 30s
+            scrape_timeout: 25s
             static_configs:
               - targets: ["process_exporter:9256"]
 
@@ -156,13 +158,14 @@ services:
     command:
       - -c
       - |
-        cat > /config/process-exporter.yml << 'EOF'
+        mkdir -p /config
+        cat > /config/process-exporter.yml << 'CONF'
         process_names:
           - name: "{{.Comm}}"
             cmdline:
               - ".+"
-        EOF
-        echo "Config written:"
+        CONF
+        echo "=== Config written ==="
         cat /config/process-exporter.yml
     volumes:
       - process-exporter-config:/config
@@ -173,32 +176,47 @@ services:
           memory: 32M
 
   # ── 4b. PROCESS EXPORTER ─────────────────────────────────────────────────────
-  # ncabatoff/process-exporter is a distroless image — no shell, no wget, no curl.
-  # The healthcheck MUST use a TCP probe, not wget/curl.
-  # "test: none" disables Docker's healthcheck so Prometheus always scrapes it
-  # regardless of Docker health state — the exporter is healthy if it's listening.
+  # Uses alpine:3.19 (has /bin/sh + wget for healthcheck) with the process-exporter
+  # binary mounted from the host at /tmp/process-exporter-binary.
+  # This was confirmed working: the binary + config combo responds correctly.
+  # The original ncabatoff/process-exporter:latest container had a broken network
+  # namespace from a previous failed deploy — this approach avoids that entirely.
+  #
+  # ⚠️  PREREQUISITE: the binary must exist on the host at this path.
+  # To set it up once:
+  #   docker cp <process_exporter_container>:/bin/process-exporter /opt/process-exporter
+  # It's already at /tmp/process-exporter-binary from the debugging session.
+  # Move it to a permanent location:
+  #   sudo mv /tmp/process-exporter-binary /opt/process-exporter
+  #   sudo chmod +x /opt/process-exporter
   process_exporter:
-    image: ncabatoff/process-exporter:latest
+    image: alpine:3.19
     container_name: process_exporter
     restart: unless-stopped
     privileged: true
     pid: host
     depends_on:
       - process-config-init
+    entrypoint:
+      - /bin-vol/process-exporter
     command:
-      - "--config.path=/config/process-exporter.yml"
-      - "--procfs=/host/proc"
+      - "-config.path=/config/process-exporter.yml"
+      - "-procfs=/host/proc"
+      - "-recheck"
     volumes:
       - /proc:/host/proc:ro
       - process-exporter-config:/config:ro
-    # Disable Docker healthcheck — the image has no shell tools (distroless).
-    # Prometheus scrapes :9256 directly; if the port is up, metrics flow.
+      - process-exporter-bin:/bin-vol:ro  # named volume containing the binary
     healthcheck:
-      disable: true
+      test: ["CMD", "wget", "-qO-", "http://localhost:9256/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.5"
           memory: 128M
         reservations:
           cpus: "0.05"
