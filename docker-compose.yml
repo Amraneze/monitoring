@@ -4,6 +4,7 @@ volumes:
   prometheus-data:
   grafana-data:
   trivy-cache:
+  process-exporter-config:      # shared between init container and process_exporter
 
 services:
 
@@ -95,9 +96,7 @@ services:
       - monitoring-network
 
   # ── 3. NODE EXPORTER ─────────────────────────────────────────────────────────
-  # FIX: removed --collector.systemd and dbus socket mount
-  # AppArmor on this host blocks dbus access from containers — removing it
-  # stops the errors and still gives full CPU/RAM/disk/temp/network metrics.
+  # --collector.systemd removed: AppArmor on this host blocks dbus from containers
   node_exporter:
     image: quay.io/prometheus/node-exporter:v1.7.0
     container_name: node_exporter
@@ -119,7 +118,6 @@ services:
       - '--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|run/docker/.+)($$|/)'
     volumes:
       - /:/host:ro,rslave
-      # Removed: dbus socket (AppArmor blocks it on this host)
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9100/metrics"]
       interval: 30s
@@ -128,37 +126,53 @@ services:
     networks:
       - monitoring-network
 
-  # ── 4. PROCESS EXPORTER ──────────────────────────────────────────────────────
-  # FIX: config is now written inline via entrypoint instead of a bind-mount.
-  # Coolify was creating a directory at the config path instead of a file,
-  # causing "is a directory" errors. Writing it at startup avoids this entirely.
+  # ── 4a. PROCESS CONFIG INIT ───────────────────────────────────────────────────
+  # Runs once at startup using alpine (which has /bin/sh) to write the
+  # process-exporter config into a named volume. Exits immediately after.
+  # This avoids the bind-mount directory problem Coolify has with file mounts,
+  # and avoids the missing /bin/sh problem in the process-exporter image itself.
+  process-config-init:
+    image: alpine:3.19
+    container_name: process_config_init
+    restart: "no"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        cat > /config/process-exporter.yml << 'EOF'
+        process_names:
+          - name: "{{.Comm}}"
+            cmdline:
+              - ".+"
+        EOF
+        echo "process-exporter config written:"
+        cat /config/process-exporter.yml
+    volumes:
+      - process-exporter-config:/config
+
+  # ── 4b. PROCESS EXPORTER ─────────────────────────────────────────────────────
+  # Uses its native entrypoint (binary only, no shell needed).
+  # Reads config from the named volume written by process-config-init above.
   process_exporter:
     image: ncabatoff/process-exporter:latest
     container_name: process_exporter
     restart: unless-stopped
     privileged: true
     pid: host
-    entrypoint: /bin/sh
+    depends_on:
+      - process-config-init
     command:
-      - -c
-      - |
-        mkdir -p /etc/process-exporter
-        cat > /etc/process-exporter/config.yml << 'EOF'
-        process_names:
-          - name: "{{.Comm}}"
-            cmdline:
-              - ".+"
-        EOF
-        exec /bin/process-exporter \
-          --config.path=/etc/process-exporter/config.yml \
-          --procfs=/host/proc
+      - "--config.path=/config/process-exporter.yml"
+      - "--procfs=/host/proc"
     volumes:
       - /proc:/host/proc:ro
+      - process-exporter-config:/config:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9256/metrics"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9256/metrics > /dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
     networks:
       - monitoring-network
 
@@ -182,7 +196,7 @@ services:
     networks:
       - monitoring-network
 
-  # ── 6. RASDAEMON EXPORTER (inline Python, no external image) ─────────────────
+  # ── 6. RASDAEMON EXPORTER (inline Python) ────────────────────────────────────
   rasdaemon_exporter:
     image: python:3.12-alpine
     container_name: rasdaemon_exporter
@@ -200,8 +214,8 @@ services:
         PORT    = int(os.environ.get("LISTEN_PORT", "9101"))
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
-        mce_total   = Gauge("rasdaemon_mce_events_total", "Total MCE events recorded by rasdaemon")
-        mce_by_type = Gauge("rasdaemon_mce_events_by_type", "MCE events by error type", ["error_type"])
+        mce_total    = Gauge("rasdaemon_mce_events_total", "Total MCE events recorded by rasdaemon")
+        mce_by_type  = Gauge("rasdaemon_mce_events_by_type", "MCE events by error type", ["error_type"])
         db_available = Gauge("rasdaemon_db_available", "1 if rasdaemon DB is readable")
 
         def collect():
