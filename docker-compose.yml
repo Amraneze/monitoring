@@ -4,7 +4,7 @@ volumes:
   prometheus-data:
   grafana-data:
   trivy-cache:
-  process-exporter-config:      # shared between init container and process_exporter
+  process-exporter-config:
 
 services:
 
@@ -63,6 +63,14 @@ services:
           --web.enable-lifecycle
     volumes:
       - prometheus-data:/prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"       # Prometheus is query-heavy but doesn't need more than 1 core
+          memory: 512M      # currently using 246MB — give headroom for query spikes
+        reservations:
+          cpus: "0.1"
+          memory: 128M
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
       interval: 30s
@@ -87,6 +95,14 @@ services:
       SERVICE_FQDN_GRAFANA: ${SERVICE_FQDN_GRAFANA}
     volumes:
       - grafana-data:/var/lib/grafana
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"       # currently 0.34% — 0.5 core is plenty with room to spike
+          memory: 256M      # currently 65MB — 256M gives room for dashboard rendering
+        reservations:
+          cpus: "0.05"
+          memory: 64M
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
       interval: 30s
@@ -96,7 +112,10 @@ services:
       - monitoring-network
 
   # ── 3. NODE EXPORTER ─────────────────────────────────────────────────────────
-  # --collector.systemd removed: AppArmor on this host blocks dbus from containers
+  # ⚠️  Was using 628% CPU — caused by --collector.processes iterating all
+  # host PIDs every scrape interval. Fixed by removing that collector and
+  # using process_exporter instead (which is purpose-built for this).
+  # Also removed --collector.vmstat and --collector.netstat to reduce load.
   node_exporter:
     image: quay.io/prometheus/node-exporter:v1.7.0
     container_name: node_exporter
@@ -104,7 +123,6 @@ services:
     pid: host
     command:
       - "--path.rootfs=/host"
-      - "--collector.processes"
       - "--collector.diskstats"
       - "--collector.filesystem"
       - "--collector.meminfo"
@@ -114,10 +132,20 @@ services:
       - "--collector.edac"
       - "--collector.netstat"
       - "--collector.stat"
-      - "--collector.vmstat"
+      # Removed: --collector.processes  ← this was causing the 628% CPU spike
+      # Removed: --collector.vmstat     ← reduces per-scrape work
+      # Removed: --collector.systemd    ← blocked by AppArmor on this host
       - '--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|run/docker/.+)($$|/)'
     volumes:
       - /:/host:ro,rslave
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"       # should be well under this without --collector.processes
+          memory: 64M       # currently 24MB — 64M is generous
+        reservations:
+          cpus: "0.02"
+          memory: 32M
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9100/metrics"]
       interval: 30s
@@ -127,10 +155,6 @@ services:
       - monitoring-network
 
   # ── 4a. PROCESS CONFIG INIT ───────────────────────────────────────────────────
-  # Runs once at startup using alpine (which has /bin/sh) to write the
-  # process-exporter config into a named volume. Exits immediately after.
-  # This avoids the bind-mount directory problem Coolify has with file mounts,
-  # and avoids the missing /bin/sh problem in the process-exporter image itself.
   process-config-init:
     image: alpine:3.19
     container_name: process_config_init
@@ -149,10 +173,13 @@ services:
         cat /config/process-exporter.yml
     volumes:
       - process-exporter-config:/config
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 32M
 
   # ── 4b. PROCESS EXPORTER ─────────────────────────────────────────────────────
-  # Uses its native entrypoint (binary only, no shell needed).
-  # Reads config from the named volume written by process-config-init above.
   process_exporter:
     image: ncabatoff/process-exporter:latest
     container_name: process_exporter
@@ -167,6 +194,14 @@ services:
     volumes:
       - /proc:/host/proc:ro
       - process-exporter-config:/config:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"       # currently 3.28% avg — 0.3 core cap allows spikes
+          memory: 128M      # currently 54MB — 128M gives room
+        reservations:
+          cpus: "0.05"
+          memory: 32M
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9256/metrics > /dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -188,6 +223,14 @@ services:
       - "--smartctl.interval=120s"
     volumes:
       - /dev:/dev:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"       # currently ~0% — SMART reads are infrequent
+          memory: 64M       # currently 11MB — 64M is very generous
+        reservations:
+          cpus: "0.01"
+          memory: 16M
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9633/metrics"]
       interval: 60s
@@ -196,7 +239,7 @@ services:
     networks:
       - monitoring-network
 
-  # ── 6. RASDAEMON EXPORTER (inline Python) ────────────────────────────────────
+  # ── 6. RASDAEMON EXPORTER ────────────────────────────────────────────────────
   rasdaemon_exporter:
     image: python:3.12-alpine
     container_name: rasdaemon_exporter
@@ -254,6 +297,14 @@ services:
       - LISTEN_PORT=9101
     volumes:
       - /var/lib/rasdaemon:/var/lib/rasdaemon:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"       # currently 0.04% — very light
+          memory: 64M       # currently 16MB — 64M is plenty
+        reservations:
+          cpus: "0.01"
+          memory: 32M
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9101/metrics"]
       interval: 60s
@@ -264,6 +315,8 @@ services:
       - monitoring-network
 
   # ── 7. TRIVY EXPORTER ────────────────────────────────────────────────────────
+  # Note: trivy scans are CPU/memory intensive during the scan window (every 6h).
+  # Limit is set high enough to not stall scans but prevent runaway usage.
   trivy_exporter:
     image: aquasec/trivy:canary
     container_name: trivy_exporter
@@ -371,6 +424,14 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - trivy-cache:/cache
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"       # scans are CPU intensive — needs room during scan window
+          memory: 512M      # currently 48MB idle, spikes during scans with many images
+        reservations:
+          cpus: "0.05"
+          memory: 64M
     networks:
       - monitoring-network
 
