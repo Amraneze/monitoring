@@ -1,0 +1,34 @@
+# process-exporter-config.yml
+#
+# Groups processes for tracking. Each group produces its own metrics
+# so you can see CPU, memory, and I/O per process name in Grafana.
+#
+# Strategy: "name" groups by the executable name so you get one time-series
+# per distinct process (e.g. nginx, postgres, node, python3, etc.)
+
+process_names:
+
+  # ── Catch-all: group every process by its executable name ──────────────────
+  # This gives you history for ALL processes without listing each one manually.
+  - name: "{{.Comm}}"
+    cmdline:
+      - ".+"
+
+  # ── Uncomment below to create dedicated groups for key services ───────────
+  # These take priority over the catch-all above (matched top-to-bottom).
+
+  # - name: "nginx"
+  #   cmdline:
+  #     - "nginx"
+
+  # - name: "postgres"
+  #   cmdline:
+  #     - "postgres"
+
+  # - name: "docker"
+  #   cmdline:
+  #     - "dockerd|containerd"
+
+  # - name: "node"
+  #   cmdline:
+  #     - "node"

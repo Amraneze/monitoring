@@ -1,13 +1,26 @@
 version: "3.8"
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  FULL MONITORING STACK
+#  ─ Prometheus + Grafana (UI)
+#  ─ node_exporter      (CPU / RAM / disk utilisation + health sensors)
+#  ─ process_exporter   (per-process CPU / memory / I/O history)
+#  ─ smartctl_exporter  (HDD/SSD bad sectors, SMART health)
+#  ─ rasdaemon_exporter (CPU machine-check exceptions → faulty CPU detection)
+#  ─ trivy_exporter     (container image CVE scanning)
+# ══════════════════════════════════════════════════════════════════════════════
+
 volumes:
   prometheus-data:
   grafana-data:
   trivy-cache:
 
 services:
+
+  # ── 1. PROMETHEUS ────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.49.1
+    container_name: prometheus
     restart: unless-stopped
     user: root
     entrypoint: /bin/sh
@@ -16,27 +29,53 @@ services:
       - |
         cat > /etc/prometheus/prometheus.yml << 'EOF'
         global:
-          scrape_interval: 5s
+          scrape_interval: 15s
+          evaluation_interval: 15s
           external_labels:
-            monitor: "codelab-monitor"
+            monitor: "server-health"
 
         scrape_configs:
+
           - job_name: "prometheus"
             static_configs:
               - targets: ["prometheus:9090"]
+
+          # Hardware utilisation + health sensors (CPU temp, ECC errors, disk space)
           - job_name: "node_exporter"
+            scrape_interval: 10s
             static_configs:
               - targets: ["node_exporter:9100"]
+
+          # Per-process CPU / memory / disk I/O history
+          - job_name: "process_exporter"
+            scrape_interval: 10s
+            static_configs:
+              - targets: ["process_exporter:9256"]
+
+          # HDD / SSD SMART health: bad sectors, reallocated sectors, temperature
+          - job_name: "smartctl_exporter"
+            scrape_interval: 60s      # SMART reads are slow, 60s is fine
+            static_configs:
+              - targets: ["smartctl_exporter:9633"]
+
+          # CPU machine check exceptions (hardware faults / corrected errors)
+          - job_name: "rasdaemon_exporter"
+            scrape_interval: 30s
+            static_configs:
+              - targets: ["rasdaemon_exporter:9101"]
+
+          # Container image vulnerability scanning
           - job_name: "trivy"
             scrape_interval: 2m
             scrape_timeout: 30s
             static_configs:
-              - targets: ["trivy-exporter:9000"]
+              - targets: ["trivy_exporter:9000"]
+
         EOF
         exec /bin/prometheus \
           --config.file=/etc/prometheus/prometheus.yml \
           --storage.tsdb.path=/prometheus \
-          --storage.tsdb.retention.time=15d \
+          --storage.tsdb.retention.time=30d \
           --web.enable-lifecycle
     volumes:
       - prometheus-data:/prometheus
@@ -48,19 +87,27 @@ services:
     networks:
       - monitoring-network
 
+  # ── 2. GRAFANA ───────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.3.1
+    container_name: grafana
     restart: unless-stopped
     depends_on:
       prometheus:
         condition: service_healthy
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin          # ⚠️ change this
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # Auto-provision Prometheus as data source
+      GF_DATASOURCES_DEFAULT_NAME: Prometheus
+      GF_DATASOURCES_DEFAULT_TYPE: prometheus
+      GF_DATASOURCES_DEFAULT_URL: http://prometheus:9090
     volumes:
       - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
       interval: 30s
@@ -69,16 +116,33 @@ services:
     networks:
       - monitoring-network
 
+  # ── 3. NODE EXPORTER ─────────────────────────────────────────────────────────
+  # Exposes: CPU, RAM, disk space, network, load avg, hardware temps (hwmon),
+  #          ECC memory errors (edac), filesystem health
   node_exporter:
     image: quay.io/prometheus/node-exporter:v1.7.0
+    container_name: node_exporter
     restart: unless-stopped
     pid: host
     command:
       - "--path.rootfs=/host"
       - "--collector.systemd"
       - "--collector.processes"
+      - "--collector.diskstats"
+      - "--collector.filesystem"
+      - "--collector.meminfo"
+      - "--collector.cpu"
+      - "--collector.loadavg"
+      - "--collector.hwmon"        # CPU / disk / board temperatures & fan speeds
+      - "--collector.edac"         # ECC RAM corrected/uncorrected error counts
+      - "--collector.netstat"
+      - "--collector.stat"
+      - "--collector.vmstat"
+      # Ignore virtual/container filesystems to reduce noise
+      - '--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|run/docker/.+)($$|/)'
     volumes:
-      - "/:/host:ro,rslave"
+      - /:/host:ro,rslave
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9100/metrics"]
       interval: 30s
@@ -87,8 +151,92 @@ services:
     networks:
       - monitoring-network
 
-  trivy-exporter:
+  # ── 4. PROCESS EXPORTER ──────────────────────────────────────────────────────
+  # Tracks per-process CPU, memory RSS, and disk I/O over time.
+  # Grouped by executable name so you get one series per process type.
+  process_exporter:
+    image: ncabatoff/process-exporter:0.8.3
+    container_name: process_exporter
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    command:
+      - "--config.path=/etc/process-exporter/config.yml"
+      - "--procfs=/host/proc"
+    volumes:
+      - /proc:/host/proc:ro
+      - ./config/process-exporter-config.yml:/etc/process-exporter/config.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9256/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - monitoring-network
+
+  # ── 5. SMARTCTL EXPORTER ─────────────────────────────────────────────────────
+  # Reads SMART data from all drives:
+  #   • Overall health (PASSED / FAILED)
+  #   • Reallocated sectors (early sign of drive failure)
+  #   • Pending sectors (sectors waiting to be reallocated)
+  #   • Uncorrectable errors
+  #   • Drive temperature
+  #   • Power-on hours
+  #   • SSD wear level / remaining life
+  smartctl_exporter:
+    image: prometheuscommunity/smartctl-exporter:v0.12.0
+    container_name: smartctl_exporter
+    restart: unless-stopped
+    privileged: true              # needs raw disk access
+    user: root
+    command:
+      - "--smartctl.path=/usr/sbin/smartctl"
+      - "--smartctl.interval=120s"   # how often to poll drives
+    volumes:
+      - /dev:/dev:ro               # access to raw disk devices
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9633/metrics"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    networks:
+      - monitoring-network
+
+  # ── 6. RASDAEMON EXPORTER ────────────────────────────────────────────────────
+  # Monitors CPU Machine Check Exceptions (MCE) — the Linux mechanism that
+  # reports hardware errors: faulty CPU cores, bad RAM, bus errors, etc.
+  #
+  # How it works:
+  #   rasdaemon collects MCE events from the kernel into a SQLite DB.
+  #   This exporter reads that DB and exposes the counts as Prometheus metrics.
+  #
+  # ⚠️  rasdaemon must be running on the HOST (not in Docker) to capture events.
+  #     Install it with: sudo apt install rasdaemon && sudo systemctl enable --now rasdaemon
+  #
+  # This container then reads the rasdaemon database from the host.
+  rasdaemon_exporter:
+    image: pbrane/rasdaemon-exporter:latest
+    container_name: rasdaemon_exporter
+    restart: unless-stopped
+    volumes:
+      - /var/lib/rasdaemon:/var/lib/rasdaemon:ro   # rasdaemon SQLite DB
+    environment:
+      - RASDAEMON_DB=/var/lib/rasdaemon/ras-mc_event.db
+      - LISTEN_PORT=9101
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9101/metrics"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    networks:
+      - monitoring-network
+
+  # ── 7. TRIVY EXPORTER ────────────────────────────────────────────────────────
+  # Scans all local Docker images for CVEs every 6 hours.
+  # Exposes results as Prometheus metrics on :9000.
+  trivy_exporter:
     image: aquasec/trivy:canary
+    container_name: trivy_exporter
     restart: unless-stopped
     entrypoint: /bin/sh
     command:
@@ -99,10 +247,8 @@ services:
         METRICS_FILE=/cache/metrics.prom
         CACHE_DIR=/cache/trivycache
 
-        # Write the Python HTTP server to a file
         cat > /tmp/serve.py << 'PYEOF'
-        import http.server
-        import os
+        import http.server, os
 
         METRICS_FILE = "/cache/metrics.prom"
 
@@ -119,18 +265,15 @@ services:
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
                 self.wfile.write(encoded)
-
             def log_message(self, format, *args):
-                pass  # silence access logs
+                pass
 
         print("Trivy metrics server listening on port 9000...")
-        server = http.server.HTTPServer(("0.0.0.0", 9000), Handler)
-        server.serve_forever()
+        http.server.HTTPServer(("0.0.0.0", 9000), Handler).serve_forever()
         PYEOF
 
-        # Write the scan script to a file
         cat > /tmp/scan.py << 'PYEOF'
-        import subprocess, json, os, sys, time
+        import subprocess, json, os, time
 
         METRICS_FILE = "/cache/metrics.prom"
         TMP_FILE     = "/cache/metrics.tmp"
@@ -143,22 +286,13 @@ services:
                 ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
                 capture_output=True, text=True
             )
-            images = [
-                i for i in result.stdout.strip().splitlines()
-                if i and "<none>" not in i
-            ]
+            images = [i for i in result.stdout.strip().splitlines() if i and "<none>" not in i]
             return list(set(images))
 
         def scan_image(image):
             result = subprocess.run(
-                [
-                    "trivy", "image",
-                    "--format", "json",
-                    "--quiet",
-                    "--no-progress",
-                    "--cache-dir", CACHE_DIR,
-                    image
-                ],
+                ["trivy", "image", "--format", "json", "--quiet",
+                 "--no-progress", "--cache-dir", CACHE_DIR, image],
                 capture_output=True, text=True, timeout=600
             )
             try:
@@ -179,16 +313,13 @@ services:
 
         while True:
             images = get_images()
-            print(f"[trivy-scan] Found {len(images)} images to scan", flush=True)
+            print(f"[trivy-scan] Scanning {len(images)} images...", flush=True)
             all_metrics = []
-
             for image in images:
                 print(f"[trivy-scan] Scanning {image} ...", flush=True)
                 data = scan_image(image)
                 if not data:
-                    print(f"[trivy-scan] No data for {image}", flush=True)
                     continue
-
                 count = 0
                 for result in data.get("Results", []):
                     for vuln in result.get("Vulnerabilities") or []:
@@ -202,20 +333,13 @@ services:
                         )
                         all_metrics.append(f"trivy_vulnerabilities{{{labels}}} 1")
                         count += 1
-
                 print(f"[trivy-scan] {image} -> {count} vulnerabilities", flush=True)
-
             write_metrics(all_metrics)
-            total = len(all_metrics)
-            print(f"[trivy-scan] Scan complete. {total} total vulnerabilities written.", flush=True)
-            print(f"[trivy-scan] Next scan in 6 hours.", flush=True)
+            print(f"[trivy-scan] Done. {len(all_metrics)} total. Next scan in 6h.", flush=True)
             time.sleep(21600)
         PYEOF
 
-        # Start HTTP server in background
         python3 /tmp/serve.py &
-
-        # Start scan loop in foreground
         python3 /tmp/scan.py
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
